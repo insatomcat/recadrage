@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Recadrage</title>
+    <link rel="stylesheet" href="/styles.css?v=5" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <h1>Recadrage</h1>
+          <span id="server-status" class="server-status hidden"></span>
+        </div>
+        <div class="toolbar">
+          <label class="file-btn">
+            Ouvrir
+            <input id="file-input" type="file" accept=".mp4,.mov,.m4v,video/mp4,video/quicktime" hidden />
+          </label>
+          <button id="save-project" type="button" class="toolbar-btn hidden" disabled>Sauver</button>
+          <label id="load-project-label" class="toolbar-btn hidden">
+            Charger
+            <input id="load-project" type="file" accept=".json,application/json" hidden />
+          </label>
+          <span id="file-name" class="file-name">Aucun fichier</span>
+        </div>
+      </header>
+
+      <section id="welcome" class="welcome">
+        <p>Ouvrez une vidéo MP4 ou MOV pour commencer.</p>
+      </section>
+
+      <section id="editor" class="editor hidden">
+        <div class="workspace">
+          <div class="main-column">
+            <div class="stage-wrap">
+              <div id="stage" class="stage">
+                <video id="video" playsinline preload="auto"></video>
+                <canvas id="overlay"></canvas>
+              </div>
+            </div>
+            <div class="timeline-block">
+              <div class="timeline">
+                <button id="play-btn" type="button" aria-label="Lecture / pause">▶</button>
+                <span id="time-current" class="time">00:00</span>
+                <div
+                  id="scrubber-wrap"
+                  class="scrubber-wrap"
+                  role="slider"
+                  aria-valuemin="0"
+                  aria-valuemax="1000"
+                  aria-valuenow="0"
+                  aria-label="Position dans la vidéo"
+                  tabindex="0"
+                >
+                  <div class="scrubber-track">
+                    <div id="scrubber-fill" class="scrubber-fill"></div>
+                    <div id="scrubber-thumb" class="scrubber-thumb"></div>
+                  </div>
+                  <div id="keyframe-markers" class="keyframe-markers" aria-hidden="true"></div>
+                </div>
+                <span id="time-duration" class="time">00:00</span>
+              </div>
+            </div>
+          </div>
+
+          <aside class="sidebar">
+            <div class="sidebar-scroll">
+              <div class="controls-panel">
+                <div class="control-group">
+                  <label for="aspect-preset">Aspect ratio</label>
+                  <select id="aspect-preset">
+                    <option value="source">Ratio initial</option>
+                    <option value="16:9">16:9</option>
+                    <option value="9:16">9:16</option>
+                    <option value="4:3">4:3</option>
+                    <option value="1:1">1:1</option>
+                    <option value="custom">Personnalisé</option>
+                  </select>
+                </div>
+                <div id="custom-aspect" class="control-group hidden">
+                  <label>Ratio perso</label>
+                  <div class="inline-inputs">
+                    <input id="aspect-w" type="number" min="1" value="16" />
+                    <span>:</span>
+                    <input id="aspect-h" type="number" min="1" value="9" />
+                  </div>
+                </div>
+                <div class="control-group">
+                  <label for="resolution-mode">Résolution</label>
+                  <select id="resolution-mode">
+                    <option value="source">Canvas source</option>
+                    <option value="fit_aspect">Adapter au ratio</option>
+                  </select>
+                </div>
+                <div class="control-group control-group--narrow">
+                  <label for="crf">CRF</label>
+                  <input id="crf" type="number" min="0" max="51" value="23" />
+                </div>
+                <div class="control-group control-group--narrow">
+                  <label for="pad-color">Bandes</label>
+                  <input id="pad-color" type="color" value="#000000" />
+                </div>
+                <div class="control-actions">
+                  <button id="reset-frame" type="button" class="secondary">Centrer</button>
+                  <button id="export-btn" type="button" class="primary">Exporter</button>
+                </div>
+              </div>
+
+              <div class="keyframes-panel">
+                <div class="keyframes-header">
+                  <span class="panel-label">Cadrages</span>
+                  <button id="add-keyframe" type="button" class="secondary keyframe-add">+ Ici</button>
+                </div>
+                <ul id="keyframe-list" class="keyframe-list"></ul>
+              </div>
+
+              <p class="hint">
+                Interpolation entre cadrages · Coins : crop · Centre : déplacer
+              </p>
+
+              <div id="export-banner" class="export-banner hidden" role="status" aria-live="polite">
+                <div class="spinner" aria-hidden="true"></div>
+                <div class="export-banner-body">
+                  <strong id="export-banner-title">Export en cours</strong>
+                  <span id="export-banner-text">Préparation…</span>
+                  <progress id="export-progress" class="export-progress" value="0" max="100" hidden></progress>
+                </div>
+              </div>
+
+              <div id="status" class="status hidden"></div>
+
+              <div id="export-result" class="export-result hidden">
+                <p>Export terminé.</p>
+                <a id="download-link" href="#" download>Télécharger</a>
+              </div>
+            </div>
+
+            <div id="export-log-wrap" class="export-log-wrap hidden">
+              <label class="export-log-label">Console ffmpeg</label>
+              <pre id="export-log" class="export-log" aria-label="Sortie ffmpeg"></pre>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </div>
+
+    <script src="/app.js?v=26"></script>
+  </body>
+</html>
