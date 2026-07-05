@@ -13,8 +13,14 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from backend.export_jobs import get_job, read_job_log, start_export
-from backend.export_jobs import _logs_dir
+from backend.export_jobs import (
+    clear_jobs_registry,
+    get_job,
+    has_active_exports,
+    read_job_log,
+    start_export,
+    _logs_dir,
+)
 from backend.ffmpeg_utils import build_browser_preview, needs_browser_preview, probe_video
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,10 +28,18 @@ DATA_DIR = ROOT / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 EXPORTS_DIR = DATA_DIR / "exports"
 LOGS_DIR = DATA_DIR / "logs"
+TMP_DIR = DATA_DIR / "tmp"
 FRONTEND_DIR = ROOT / "frontend"
 
-for directory in (UPLOADS_DIR, EXPORTS_DIR, LOGS_DIR):
+for directory in (UPLOADS_DIR, EXPORTS_DIR, LOGS_DIR, TMP_DIR):
     directory.mkdir(parents=True, exist_ok=True)
+
+_STORAGE_DIRS: dict[str, Path] = {
+    "uploads": UPLOADS_DIR,
+    "exports": EXPORTS_DIR,
+    "logs": LOGS_DIR,
+    "tmp": TMP_DIR,
+}
 
 import backend.export_jobs as export_jobs_module
 
@@ -63,6 +77,10 @@ class ExportRequest(BaseModel):
     resolution_mode: str = Field(default="source", pattern="^(source|fit_aspect)$")
     pad_color: str = "black"
     crf: int = Field(default=23, ge=0, le=51)
+    interpolate_keyframes: bool = True
+    transition_sec: float = Field(default=1.0, ge=0.0, le=30.0)
+    export_start: float = Field(default=0.0, ge=0.0)
+    export_end: float | None = Field(default=None, ge=0.0)
 
 
 def _preview_path(video_id: str) -> Path:
@@ -84,12 +102,76 @@ def _playback_url(video_id: str) -> str:
     return f"/api/videos/{video_id}/file"
 
 
+def _dir_stats(path: Path) -> dict[str, int]:
+    files = 0
+    nbytes = 0
+    if not path.is_dir():
+        return {"files": 0, "bytes": 0}
+    for child in path.rglob("*"):
+        if child.is_file():
+            files += 1
+            try:
+                nbytes += child.stat().st_size
+            except OSError:
+                pass
+    return {"files": files, "bytes": nbytes}
+
+
+def _clear_directory(path: Path) -> dict[str, int]:
+    files = 0
+    nbytes = 0
+    if not path.is_dir():
+        return {"files": 0, "bytes": 0}
+    for child in list(path.iterdir()):
+        if child.is_file():
+            try:
+                nbytes += child.stat().st_size
+            except OSError:
+                pass
+            child.unlink(missing_ok=True)
+            files += 1
+        elif child.is_dir():
+            sub = _dir_stats(child)
+            files += sub["files"]
+            nbytes += sub["bytes"]
+            shutil.rmtree(child, ignore_errors=True)
+    return {"files": files, "bytes": nbytes}
+
+
 @app.get("/api/health")
 def health() -> JSONResponse:
     return JSONResponse(
         content={"status": "ok", "api_version": 5, "logs_dir": str(_logs_dir())},
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/api/data/stats")
+def data_stats() -> dict:
+    return {name: _dir_stats(path) for name, path in _STORAGE_DIRS.items()}
+
+
+@app.post("/api/data/cleanup")
+def data_cleanup() -> dict:
+    if has_active_exports():
+        raise HTTPException(
+            status_code=409,
+            detail="Un export est en cours. Attendez la fin avant de nettoyer.",
+        )
+    removed: dict[str, dict[str, int]] = {}
+    total_files = 0
+    total_bytes = 0
+    for name, path in _STORAGE_DIRS.items():
+        stats = _clear_directory(path)
+        removed[name] = stats
+        total_files += stats["files"]
+        total_bytes += stats["bytes"]
+    clear_jobs_registry()
+    return {
+        "removed": removed,
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+    }
 
 
 @app.post("/api/upload")
@@ -207,6 +289,10 @@ def export_reframed(payload: ExportRequest) -> dict:
             "resolution_mode": payload.resolution_mode,
             "pad_color": payload.pad_color,
             "crf": payload.crf,
+            "interpolate_keyframes": payload.interpolate_keyframes,
+            "transition_sec": payload.transition_sec,
+            "export_start": payload.export_start,
+            "export_end": payload.export_end,
         },
     )
     return {"job_id": job_id}

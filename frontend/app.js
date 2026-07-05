@@ -29,7 +29,17 @@ const state = {
   playbackRaf: null,
   /** @type {{ w: number, h: number }} */
   overlaySize: { w: 0, h: 0 },
+  /** @type {object | null} Projet JSON en attente d'une vidéo correspondante */
+  pendingProject: null,
+  /** @type {number} Temps source (s) — début de la plage export */
+  sliceIn: 0,
+  /** @type {number} Temps source (s) — fin de la plage export */
+  sliceOut: 0,
+  /** @type {'in' | 'out' | null} */
+  sliceDragging: null,
 };
+
+const MIN_SLICE_SEC = 0.5;
 
 const els = {
   fileInput: document.getElementById("file-input"),
@@ -37,8 +47,10 @@ const els = {
   saveProjectBtn: document.getElementById("save-project"),
   loadProjectInput: /** @type {HTMLInputElement} */ (document.getElementById("load-project")),
   loadProjectLabel: document.getElementById("load-project-label"),
+  cleanupDataBtn: document.getElementById("cleanup-data"),
   serverStatus: document.getElementById("server-status"),
   welcome: document.getElementById("welcome"),
+  pendingProjectMsg: document.getElementById("pending-project-msg"),
   editor: document.getElementById("editor"),
   stage: document.getElementById("stage"),
   video: /** @type {HTMLVideoElement} */ (document.getElementById("video")),
@@ -50,6 +62,10 @@ const els = {
   resolutionMode: /** @type {HTMLSelectElement} */ (document.getElementById("resolution-mode")),
   crf: /** @type {HTMLInputElement} */ (document.getElementById("crf")),
   padColor: /** @type {HTMLInputElement} */ (document.getElementById("pad-color")),
+  interpolateKeyframes: /** @type {HTMLInputElement} */ (
+    document.getElementById("interpolate-keyframes")
+  ),
+  transitionSec: /** @type {HTMLInputElement} */ (document.getElementById("transition-sec")),
   resetFrame: document.getElementById("reset-frame"),
   addKeyframe: document.getElementById("add-keyframe"),
   keyframeList: document.getElementById("keyframe-list"),
@@ -59,6 +75,12 @@ const els = {
   scrubberWrap: document.getElementById("scrubber-wrap"),
   scrubberFill: document.getElementById("scrubber-fill"),
   scrubberThumb: document.getElementById("scrubber-thumb"),
+  sliceMaskLeft: document.getElementById("slice-mask-left"),
+  sliceMaskRight: document.getElementById("slice-mask-right"),
+  sliceRange: document.getElementById("slice-range"),
+  sliceInHandle: document.getElementById("slice-in-handle"),
+  sliceOutHandle: document.getElementById("slice-out-handle"),
+  sliceRangeLabel: document.getElementById("slice-range-label"),
   timeCurrent: document.getElementById("time-current"),
   timeDuration: document.getElementById("time-duration"),
   status: document.getElementById("status"),
@@ -105,6 +127,88 @@ function getVideoDuration() {
   const fromMeta = state.video?.duration;
   if (Number.isFinite(fromMeta) && fromMeta > 0) return fromMeta;
   return 0;
+}
+
+function getSliceOut() {
+  const duration = getVideoDuration();
+  if (duration <= 0) return 0;
+  if (state.sliceOut > 0 && state.sliceOut <= duration) return state.sliceOut;
+  return duration;
+}
+
+function resetSliceRange() {
+  const duration = getVideoDuration();
+  state.sliceIn = 0;
+  state.sliceOut = duration > 0 ? duration : 0;
+  renderSliceUI();
+}
+
+function renderSliceUI() {
+  const duration = getVideoDuration();
+  if (duration <= 0 || !els.sliceInHandle || !els.sliceOutHandle) return;
+
+  const sliceOut = getSliceOut();
+  const inPct = (state.sliceIn / duration) * 100;
+  const outPct = (sliceOut / duration) * 100;
+
+  els.sliceInHandle.style.left = `${inPct}%`;
+  els.sliceOutHandle.style.left = `${outPct}%`;
+  if (els.sliceMaskLeft) els.sliceMaskLeft.style.width = `${inPct}%`;
+  if (els.sliceMaskRight) els.sliceMaskRight.style.width = `${100 - outPct}%`;
+  if (els.sliceRange) {
+    els.sliceRange.style.left = `${inPct}%`;
+    els.sliceRange.style.width = `${Math.max(0, outPct - inPct)}%`;
+  }
+
+  const partial = state.sliceIn > 0.05 || sliceOut < duration - 0.05;
+  if (els.sliceRangeLabel) {
+    if (partial) {
+      els.sliceRangeLabel.textContent = `Export : ${formatTime(state.sliceIn)} → ${formatTime(sliceOut)} (${formatTime(sliceOut - state.sliceIn)})`;
+      els.sliceRangeLabel.classList.remove("hidden");
+    } else {
+      els.sliceRangeLabel.classList.add("hidden");
+    }
+  }
+}
+
+function bindSliceListeners() {
+  document.addEventListener("pointermove", onSlicePointerMove);
+  document.addEventListener("pointerup", onSlicePointerEnd);
+  document.addEventListener("pointercancel", onSlicePointerEnd);
+}
+
+function unbindSliceListeners() {
+  document.removeEventListener("pointermove", onSlicePointerMove);
+  document.removeEventListener("pointerup", onSlicePointerEnd);
+  document.removeEventListener("pointercancel", onSlicePointerEnd);
+}
+
+function onSliceHandlePointerDown(event, which) {
+  if (!state.video || event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  state.sliceDragging = which;
+  if (!els.video.paused) els.video.pause();
+  bindSliceListeners();
+}
+
+function onSlicePointerMove(event) {
+  if (!state.sliceDragging) return;
+  const duration = getVideoDuration();
+  if (duration <= 0) return;
+  const t = ratioFromPointer(event) * duration;
+  if (state.sliceDragging === "in") {
+    state.sliceIn = Math.max(0, Math.min(t, getSliceOut() - MIN_SLICE_SEC));
+  } else {
+    state.sliceOut = Math.min(duration, Math.max(t, state.sliceIn + MIN_SLICE_SEC));
+  }
+  renderSliceUI();
+}
+
+function onSlicePointerEnd() {
+  if (!state.sliceDragging) return;
+  unbindSliceListeners();
+  state.sliceDragging = null;
 }
 
 /** Position de lecture : ratio timeline en pause, currentTime en lecture. */
@@ -203,6 +307,11 @@ function stopPlaybackLoop() {
 function updatePreviewAtTime(time) {
   state.frame = getFrameAtTime(time);
   drawOverlay();
+}
+
+function syncInterpControls() {
+  const on = els.interpolateKeyframes?.checked !== false;
+  if (els.transitionSec) els.transitionSec.disabled = !on;
 }
 
 function refreshDisplayFrame() {
@@ -457,6 +566,104 @@ function formatElapsed(seconds) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} o`;
+  const units = ["Ko", "Mo", "Go"];
+  let value = n;
+  let unitIndex = -1;
+  do {
+    value /= 1024;
+    unitIndex += 1;
+  } while (value >= 1024 && unitIndex < units.length - 1);
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
+
+function resetAppAfterCleanup() {
+  if (!els.video.paused) els.video.pause();
+  state.video = null;
+  state.keyframes = [];
+  state.activeKeyframeId = null;
+  state.playheadRatio = 0;
+  state.sliceIn = 0;
+  state.sliceOut = 0;
+  state.frame = { x: 0, y: 0, width: 0, height: 0 };
+  clearPendingProjectUi();
+  resetExportUi();
+  clearStatus();
+  els.video.removeAttribute("src");
+  els.video.load();
+  els.fileName.textContent = "Aucun fichier";
+  setScrubberVisual(0);
+  els.timeCurrent.textContent = "00:00";
+  els.timeDuration.textContent = "00:00";
+  els.editor.classList.add("hidden");
+  els.welcome?.classList.remove("hidden");
+  if (els.saveProjectBtn) {
+    els.saveProjectBtn.classList.add("hidden");
+    els.saveProjectBtn.disabled = true;
+  }
+  renderKeyframeUI();
+  renderSliceUI();
+}
+
+async function cleanupData() {
+  if (window.location.protocol === "file:") {
+    setStatus("Ouvrez http://127.0.0.1:8765 pour utiliser cette fonction.", true);
+    return;
+  }
+
+  els.cleanupDataBtn.disabled = true;
+  try {
+    const statsResponse = await fetch(`/api/data/stats?t=${Date.now()}`, { cache: "no-store" });
+    const stats = await readJsonResponse(statsResponse);
+    if (!statsResponse.ok) {
+      throw new Error(parseApiError(stats) || "Impossible de lire l'espace disque.");
+    }
+
+    const labels = {
+      uploads: "Imports",
+      exports: "Exports",
+      logs: "Logs ffmpeg",
+      tmp: "Temporaire",
+    };
+    const lines = Object.entries(labels).map(([key, label]) => {
+      const entry = stats[key] || { files: 0, bytes: 0 };
+      return `• ${label} : ${entry.files} fichier(s), ${formatBytes(entry.bytes)}`;
+    });
+    const totalFiles = Object.values(stats).reduce((sum, entry) => sum + (entry?.files || 0), 0);
+    const totalBytes = Object.values(stats).reduce((sum, entry) => sum + (entry?.bytes || 0), 0);
+
+    if (totalFiles === 0) {
+      setStatus("Rien à nettoyer — dossiers data/ déjà vides.", false);
+      return;
+    }
+
+    const message =
+      `Supprimer ${totalFiles} fichier(s) (${formatBytes(totalBytes)}) ?\n\n` +
+      `${lines.join("\n")}\n\n` +
+      "La vidéo ouverte et les exports ne seront plus disponibles sur ce serveur.";
+    if (!window.confirm(message)) return;
+
+    const response = await fetch("/api/data/cleanup", { method: "POST" });
+    const data = await readJsonResponse(response);
+    if (!response.ok) {
+      throw new Error(parseApiError(data) || "Nettoyage impossible.");
+    }
+
+    resetAppAfterCleanup();
+    setStatus(
+      `Nettoyage terminé : ${data.total_files} fichier(s), ${formatBytes(data.total_bytes)} libérés.`,
+      false,
+    );
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "Nettoyage échoué.", true);
+  } finally {
+    els.cleanupDataBtn.disabled = false;
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -529,18 +736,36 @@ function cloneFrame(frame) {
   return { x: frame.x, y: frame.y, width: frame.width, height: frame.height };
 }
 
+function getTransitionSec() {
+  const v = Number(els.transitionSec?.value);
+  return Number.isFinite(v) && v >= 0 ? v : 1;
+}
+
+/** Ratio 0–1 entre deux keyframes : palier puis fondu sur transitionSec avant t1. */
+function keyframeInterpRatio(time, t0, t1, transitionSec) {
+  const span = t1 - t0;
+  if (span <= 0) return 1;
+  const fade = Math.min(Math.max(0, transitionSec), span);
+  const fadeStart = t1 - fade;
+  if (time <= fadeStart) return 0;
+  return (time - fadeStart) / fade;
+}
+
 function getFrameAtTime(time) {
   const kfs = state.keyframes;
   if (!kfs.length) return cloneFrame(state.frame);
   if (time <= kfs[0].time) return cloneFrame(kfs[0].frame);
   if (time >= kfs[kfs.length - 1].time) return cloneFrame(kfs[kfs.length - 1].frame);
 
+  const interpolate = els.interpolateKeyframes?.checked !== false;
+  const transitionSec = getTransitionSec();
   for (let i = 0; i < kfs.length - 1; i += 1) {
     const a = kfs[i];
     const b = kfs[i + 1];
     if (time >= a.time && time <= b.time) {
-      const span = b.time - a.time;
-      const ratio = span > 0 ? (time - a.time) / span : 0;
+      const ratio = interpolate
+        ? keyframeInterpRatio(time, a.time, b.time, transitionSec)
+        : 0;
       return {
         x: lerp(a.frame.x, b.frame.x, ratio),
         y: lerp(a.frame.y, b.frame.y, ratio),
@@ -640,6 +865,7 @@ function renderKeyframeUI() {
     dot.style.left = `${(kf.time / duration) * 100}%`;
     els.keyframeMarkers.appendChild(dot);
   }
+  renderSliceUI();
 }
 
 function buildExportPayload() {
@@ -665,6 +891,10 @@ function buildExportPayload() {
     resolution_mode: els.resolutionMode.value,
     pad_color: els.padColor?.value || "#000000",
     crf: Number(els.crf.value) || 23,
+    interpolate_keyframes: els.interpolateKeyframes?.checked !== false,
+    transition_sec: getTransitionSec(),
+    export_start: state.sliceIn,
+    export_end: getSliceOut(),
   };
 }
 
@@ -674,12 +904,17 @@ function buildProject() {
     version: 2,
     video_id: state.video.id,
     filename: state.video.filename,
+    source_filename: state.video.filename,
     aspect_w: state.aspectW,
     aspect_h: state.aspectH,
     aspect_preset: els.aspectPreset.value,
     resolution_mode: els.resolutionMode.value,
     crf: Number(els.crf.value) || 23,
     pad_color: els.padColor?.value || "#000000",
+    interpolate_keyframes: els.interpolateKeyframes?.checked !== false,
+    transition_sec: getTransitionSec(),
+    export_start: state.sliceIn,
+    export_end: getSliceOut(),
     keyframes: state.keyframes.map((kf) => ({
       time: kf.time,
       frame: cloneFrame(kf.frame),
@@ -695,26 +930,58 @@ async function fetchVideoMeta(videoId) {
   return readJsonResponse(response);
 }
 
-async function applyProject(data) {
-  if (!data?.video_id) throw new Error("Projet invalide.");
-  const meta = await fetchVideoMeta(data.video_id);
-
-  state.video = {
-    id: data.video_id,
-    filename: data.filename || meta.filename || "vidéo",
-    url: meta.url,
-    width: 0,
-    height: 0,
-    duration: 0,
-    fps: 0,
-    preview: Boolean(meta.preview),
-  };
-
-  els.fileName.textContent = state.video.filename;
+function showEditor() {
   els.welcome?.classList.add("hidden");
   els.editor.classList.remove("hidden");
   els.saveProjectBtn?.classList.remove("hidden");
-  els.loadProjectLabel?.classList.remove("hidden");
+  if (els.saveProjectBtn) els.saveProjectBtn.disabled = !state.video;
+}
+
+function projectSourceName(data) {
+  return (data.source_filename || data.filename || "").trim();
+}
+
+function filenamesMatch(a, b) {
+  if (!a || !b) return false;
+  const base = (name) => name.split(/[/\\]/).pop().toLowerCase();
+  return base(a) === base(b);
+}
+
+function updatePendingProjectUi() {
+  const pending = state.pendingProject;
+  if (!pending) {
+    els.pendingProjectMsg?.classList.add("hidden");
+    return;
+  }
+  const name = projectSourceName(pending) || "le fichier vidéo indiqué dans le projet";
+  if (els.pendingProjectMsg) {
+    els.pendingProjectMsg.textContent = `Projet chargé — ouvrez « ${name} » pour restaurer les cadrages.`;
+    els.pendingProjectMsg.classList.remove("hidden");
+  }
+  if (!state.video) {
+    els.welcome?.classList.remove("hidden");
+  }
+}
+
+function clearPendingProjectUi() {
+  state.pendingProject = null;
+  els.pendingProjectMsg?.classList.add("hidden");
+}
+
+async function applyProjectSettings(data, videoRecord) {
+  state.video = {
+    id: videoRecord.id,
+    filename: data.filename || videoRecord.filename || "vidéo",
+    url: videoRecord.url,
+    width: videoRecord.width ?? 0,
+    height: videoRecord.height ?? 0,
+    duration: videoRecord.duration ?? 0,
+    fps: videoRecord.fps ?? 0,
+    preview: Boolean(videoRecord.preview),
+  };
+
+  els.fileName.textContent = state.video.filename;
+  showEditor();
   if (els.saveProjectBtn) els.saveProjectBtn.disabled = false;
 
   els.aspectPreset.value = data.aspect_preset || "source";
@@ -727,6 +994,18 @@ async function applyProject(data) {
   els.resolutionMode.value = data.resolution_mode || "source";
   els.crf.value = String(data.crf ?? 23);
   if (els.padColor) els.padColor.value = data.pad_color || "#000000";
+  if (els.interpolateKeyframes) {
+    els.interpolateKeyframes.checked = data.interpolate_keyframes !== false;
+  }
+  if (els.transitionSec) {
+    els.transitionSec.value = String(data.transition_sec ?? 1);
+  }
+  if (data.export_start != null && Number.isFinite(Number(data.export_start))) {
+    state.sliceIn = Math.max(0, Number(data.export_start));
+  }
+  if (data.export_end != null && Number.isFinite(Number(data.export_end))) {
+    state.sliceOut = Math.max(0, Number(data.export_end));
+  }
 
   state.keyframes = (data.keyframes || []).map((kf) => ({
     id: newId(),
@@ -751,8 +1030,78 @@ async function applyProject(data) {
     els.timeDuration.textContent = formatTime(state.video.duration);
   }
 
+  clampSliceAfterLoad();
   applyAspectFromPreset(false);
+  syncInterpControls();
   refreshDisplayFrame();
+}
+
+function clampSliceAfterLoad() {
+  const duration = getVideoDuration();
+  if (duration <= 0) return;
+  if (state.sliceOut <= 0 || state.sliceOut > duration) {
+    state.sliceOut = duration;
+  }
+  state.sliceIn = Math.min(Math.max(0, state.sliceIn), Math.max(0, state.sliceOut - MIN_SLICE_SEC));
+  if (state.sliceOut - state.sliceIn < MIN_SLICE_SEC) {
+    resetSliceRange();
+  } else {
+    renderSliceUI();
+  }
+}
+
+async function applyProject(data) {
+  if (!data?.video_id && !data?.keyframes?.length) {
+    throw new Error("Projet invalide.");
+  }
+
+  const sourceName = projectSourceName(data);
+
+  if (data.video_id) {
+    try {
+      const meta = await fetchVideoMeta(data.video_id);
+      await applyProjectSettings(data, {
+        id: data.video_id,
+        filename: meta.filename,
+        url: meta.url,
+        width: 0,
+        height: 0,
+        duration: meta.duration ?? 0,
+        fps: meta.fps ?? 0,
+        preview: Boolean(meta.preview),
+      });
+      clearPendingProjectUi();
+      return;
+    } catch {
+      /* vidéo absente du serveur — essai par nom de fichier */
+    }
+  }
+
+  if (state.video && sourceName && filenamesMatch(state.video.filename, sourceName)) {
+    await applyProjectSettings(data, state.video);
+    clearPendingProjectUi();
+    setStatus(`Projet appliqué à « ${state.video.filename} ».`, false);
+    return;
+  }
+
+  state.pendingProject = data;
+  updatePendingProjectUi();
+
+  if (state.video) {
+    setStatus(
+      sourceName
+        ? `Projet pour « ${sourceName} » en attente — ouvrez ce fichier pour appliquer les cadrages.`
+        : "Projet en attente — ouvrez la vidéo correspondante.",
+      false,
+    );
+  } else {
+    setStatus(
+      sourceName
+        ? `Projet chargé — ouvrez « ${sourceName} » pour restaurer les cadrages.`
+        : "Projet chargé — ouvrez la vidéo correspondante.",
+      false,
+    );
+  }
 }
 
 function saveProject() {
@@ -1102,22 +1451,47 @@ async function uploadFile(file) {
 
   state.video = data;
   state.aspectLocked = false;
-  state.keyframes = [];
   els.fileName.textContent = data.filename;
-  els.welcome?.classList.add("hidden");
-  els.editor.classList.remove("hidden");
-  els.saveProjectBtn?.classList.remove("hidden");
-  els.loadProjectLabel?.classList.remove("hidden");
-  if (els.saveProjectBtn) els.saveProjectBtn.disabled = false;
   resetExportUi();
   els.video.src = data.url;
   setScrubberVisual(0);
   els.timeDuration.textContent = formatTime(data.duration);
   els.timeCurrent.textContent = "00:00";
 
+  resetSliceRange();
+
+  if (state.pendingProject) {
+    const expected = projectSourceName(state.pendingProject);
+    if (!expected || filenamesMatch(data.filename, expected)) {
+      await applyProjectSettings(state.pendingProject, data);
+      clearPendingProjectUi();
+      setStatus(
+        expected
+          ? `Projet appliqué à « ${data.filename} ».`
+          : `Projet appliqué à la vidéo ouverte.`,
+        false,
+      );
+      clearStatus();
+      return;
+    }
+    state.keyframes = [];
+    els.aspectPreset.value = "source";
+    applyAspectFromPreset();
+    initKeyframes(state.frame);
+    setStatus(
+      `Vidéo importée. Projet en attente pour « ${expected} » — ouvrez ce fichier pour appliquer les cadrages.`,
+      false,
+    );
+    showEditor();
+    clearStatus();
+    return;
+  }
+
+  state.keyframes = [];
   els.aspectPreset.value = "source";
   applyAspectFromPreset();
   initKeyframes(state.frame);
+  showEditor();
   clearStatus();
 }
 
@@ -1203,6 +1577,12 @@ els.fileInput.addEventListener("change", async (event) => {
 els.aspectPreset.addEventListener("change", applyAspectFromPreset);
 els.aspectW.addEventListener("change", applyAspectFromPreset);
 els.aspectH.addEventListener("change", applyAspectFromPreset);
+els.interpolateKeyframes?.addEventListener("change", () => {
+  syncInterpControls();
+  refreshDisplayFrame();
+});
+els.transitionSec?.addEventListener("input", refreshDisplayFrame);
+els.transitionSec?.addEventListener("change", refreshDisplayFrame);
 els.resetFrame.addEventListener("click", () => {
   defaultCenteredFrame();
   const active = getActiveKeyframe();
@@ -1230,12 +1610,16 @@ els.loadProjectInput?.addEventListener("change", async (event) => {
   try {
     const text = await file.text();
     await applyProject(JSON.parse(text));
-    clearStatus();
+    if (!state.pendingProject) clearStatus();
   } catch (error) {
     setStatus(error instanceof Error ? error.message : "Chargement impossible.", true);
   } finally {
     input.value = "";
   }
+});
+
+els.cleanupDataBtn?.addEventListener("click", () => {
+  cleanupData();
 });
 
 els.exportBtn.addEventListener("click", exportVideo);
@@ -1284,6 +1668,7 @@ els.video.addEventListener("loadedmetadata", () => {
       state.keyframes[0].frame = cloneFrame(state.frame);
     }
     els.timeDuration.textContent = formatTime(getVideoDuration());
+    clampSliceAfterLoad();
   }
 
   refreshDisplayFrame();
@@ -1291,6 +1676,7 @@ els.video.addEventListener("loadedmetadata", () => {
 
 function onScrubberPointerDown(event) {
   if (!state.video || event.button !== 0) return;
+  if (event.target instanceof Element && event.target.closest(".slice-handle")) return;
   state.scrubbing = true;
   state.pendingScrubRatio = null;
   if (!els.video.paused) els.video.pause();
@@ -1319,7 +1705,14 @@ if (els.scrubberWrap) {
   els.scrubberWrap.addEventListener("pointerdown", onScrubberPointerDown);
 }
 
+els.sliceInHandle?.addEventListener("pointerdown", (e) => onSliceHandlePointerDown(e, "in"));
+els.sliceOutHandle?.addEventListener("pointerdown", (e) => onSliceHandlePointerDown(e, "out"));
+
 window.addEventListener("blur", () => {
+  if (state.sliceDragging) {
+    unbindSliceListeners();
+    state.sliceDragging = null;
+  }
   if (state.scrubbing) {
     unbindScrubListeners();
     state.scrubbing = false;
@@ -1345,3 +1738,4 @@ if (els.stage && typeof ResizeObserver !== "undefined") {
 }
 checkServer();
 setInterval(checkServer, 5000);
+syncInterpControls();

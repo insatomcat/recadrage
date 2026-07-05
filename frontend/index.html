@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Recadrage</title>
-    <link rel="stylesheet" href="/styles.css?v=5" />
+    <link rel="stylesheet" href="/styles.css?v=10" />
   </head>
   <body>
     <div class="app">
@@ -19,16 +19,20 @@
             <input id="file-input" type="file" accept=".mp4,.mov,.m4v,video/mp4,video/quicktime" hidden />
           </label>
           <button id="save-project" type="button" class="toolbar-btn hidden" disabled>Sauver</button>
-          <label id="load-project-label" class="toolbar-btn hidden">
+          <label id="load-project-label" class="toolbar-btn">
             Charger
             <input id="load-project" type="file" accept=".json,application/json" hidden />
           </label>
+          <button id="cleanup-data" type="button" class="toolbar-btn toolbar-btn--danger" title="Supprimer uploads, exports et logs">
+            Nettoyer
+          </button>
           <span id="file-name" class="file-name">Aucun fichier</span>
         </div>
       </header>
 
       <section id="welcome" class="welcome">
-        <p>Ouvrez une vidéo MP4 ou MOV pour commencer.</p>
+        <p>Ouvrez une vidéo MP4 ou MOV, ou chargez un projet JSON depuis la barre d'outils.</p>
+        <p id="pending-project-msg" class="pending-project-msg hidden"></p>
       </section>
 
       <section id="editor" class="editor hidden">
@@ -54,14 +58,32 @@
                   aria-label="Position dans la vidéo"
                   tabindex="0"
                 >
+                  <div id="slice-mask-left" class="slice-mask slice-mask-left"></div>
+                  <div id="slice-mask-right" class="slice-mask slice-mask-right"></div>
+                  <div id="slice-range" class="slice-range"></div>
                   <div class="scrubber-track">
                     <div id="scrubber-fill" class="scrubber-fill"></div>
                     <div id="scrubber-thumb" class="scrubber-thumb"></div>
                   </div>
                   <div id="keyframe-markers" class="keyframe-markers" aria-hidden="true"></div>
+                  <button
+                    id="slice-in-handle"
+                    type="button"
+                    class="slice-handle slice-handle-in"
+                    aria-label="Début export"
+                    tabindex="-1"
+                  ></button>
+                  <button
+                    id="slice-out-handle"
+                    type="button"
+                    class="slice-handle slice-handle-out"
+                    aria-label="Fin export"
+                    tabindex="-1"
+                  ></button>
                 </div>
                 <span id="time-duration" class="time">00:00</span>
               </div>
+              <p id="slice-range-label" class="slice-range-label hidden"></p>
             </div>
           </div>
 
@@ -102,6 +124,17 @@
                   <label for="pad-color">Bandes</label>
                   <input id="pad-color" type="color" value="#000000" />
                 </div>
+                <div class="control-group control-group--interp">
+                  <label class="interp-check" for="interpolate-keyframes">
+                    <input id="interpolate-keyframes" type="checkbox" checked />
+                    Interpolation
+                  </label>
+                  <label class="interp-fade" for="transition-sec">
+                    Fondu
+                    <input id="transition-sec" type="number" min="0" max="30" step="0.1" value="1" />
+                    s
+                  </label>
+                </div>
                 <div class="control-actions">
                   <button id="reset-frame" type="button" class="secondary">Centrer</button>
                   <button id="export-btn" type="button" class="primary">Exporter</button>
@@ -117,7 +150,7 @@
               </div>
 
               <p class="hint">
-                Interpolation entre cadrages · Coins : crop · Centre : déplacer
+                Coins : crop · Centre : déplacer · Interpolation : cadrage stable, fondu vers le keyframe suivant (durée « Fondu »)
               </p>
 
               <div id="export-banner" class="export-banner hidden" role="status" aria-live="polite">
@@ -146,6 +179,6 @@
       </section>
     </div>
 
-    <script src="/app.js?v=26"></script>
+    <script src="/app.js?v=35"></script>
   </body>
 </html>

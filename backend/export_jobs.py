@@ -17,6 +17,7 @@ from backend.ffmpeg_utils import (
     export_video,
     is_identity_export,
     probe_video,
+    _normalize_export_range,
 )
 
 EXPORTS_DIR: Path | None = None
@@ -130,15 +131,41 @@ def _run_export(
             _progress_callback(job_id, update)
 
         if is_identity_export(meta, payload):
+            ex_start = float(payload.get("export_start", 0.0))
+            export_end_raw = payload.get("export_end")
+            export_end = float(export_end_raw) if export_end_raw is not None else None
+            ex_start, ex_end, is_partial = _normalize_export_range(
+                ex_start, export_end, meta["duration"]
+            )
             _append_log(job_id, f"Source : {meta['width']}×{meta['height']}, {meta['duration']:.1f}s")
+            if is_partial:
+                _append_log(
+                    job_id,
+                    f"Plage export : {ex_start:.2f}s → {ex_end:.2f}s ({ex_end - ex_start:.1f}s)",
+                )
             _append_log(job_id, "Aucun recadrage — copie directe sans ré-encodage.")
-            export_copy(input_path, output_path, on_progress=on_progress)
+            export_copy(
+                input_path,
+                output_path,
+                export_start=ex_start,
+                export_end=ex_end if is_partial else None,
+                on_progress=on_progress,
+            )
             video_filter = "(copie directe)"
+            export_duration = ex_end - ex_start if is_partial else meta["duration"]
         else:
             keyframes = payload.get("keyframes") or []
             if not keyframes and payload.get("frame"):
                 keyframes = [{"time": 0.0, "frame": payload["frame"]}]
 
+            interpolate = payload.get("interpolate_keyframes", True)
+            transition_sec = float(payload.get("transition_sec", 1.0))
+            export_start = float(payload.get("export_start", 0.0))
+            export_end_raw = payload.get("export_end")
+            export_end = float(export_end_raw) if export_end_raw is not None else None
+            ex_start, ex_end, is_partial = _normalize_export_range(
+                export_start, export_end, meta["duration"]
+            )
             filter_spec = build_reframe_filter_keyframes(
                 source_w=meta["width"],
                 source_h=meta["height"],
@@ -147,9 +174,25 @@ def _run_export(
                 keyframes=keyframes,
                 pad_color=payload.get("pad_color", "black"),
                 duration_sec=meta["duration"],
+                fps=float(meta.get("fps") or 30.0),
+                interpolate_keyframes=interpolate,
+                transition_sec=transition_sec,
+                export_start=ex_start,
+                export_end=ex_end if is_partial else None,
             )
+            export_duration = ex_end - ex_start if is_partial else meta["duration"]
             _append_log(job_id, f"Source : {meta['width']}×{meta['height']}, {meta['duration']:.1f}s")
-            _append_log(job_id, f"Sortie : {out_w}×{out_h} · {len(keyframes)} cadrage(s)")
+            if is_partial:
+                _append_log(
+                    job_id,
+                    f"Plage export : {ex_start:.2f}s → {ex_end:.2f}s ({export_duration:.1f}s)",
+                )
+            n_seg = filter_spec.get("segment_count", "?")
+            if interpolate:
+                interp_label = f"fondu {transition_sec:g}s · {n_seg} segments"
+            else:
+                interp_label = "palier (sans interpolation)"
+            _append_log(job_id, f"Sortie : {out_w}×{out_h} · {len(keyframes)} cadrage(s) · {interp_label}")
             if source_bitrate > 0:
                 _append_log(job_id, f"Débit source : {source_bitrate // 1000} kb/s")
             filter_label = filter_spec.get("filter_complex") or filter_spec.get("vf", "")
@@ -160,7 +203,9 @@ def _run_export(
                 output_path,
                 filter_spec.get("vf", ""),
                 filter_complex=filter_spec.get("filter_complex", ""),
-                duration_sec=meta["duration"],
+                audio_filter=filter_spec.get("audio_filter", ""),
+                input_seek=float(filter_spec.get("input_seek") or 0.0),
+                duration_sec=export_duration,
                 crf=payload.get("crf", 23),
                 source_bitrate=source_bitrate,
                 on_progress=on_progress,
@@ -212,6 +257,16 @@ def start_export(input_path: Path, payload: dict[str, Any]) -> str:
 def get_job(job_id: str) -> ExportJob | None:
     with _lock:
         return _jobs.get(job_id)
+
+
+def has_active_exports() -> bool:
+    with _lock:
+        return any(job.status in ("pending", "running") for job in _jobs.values())
+
+
+def clear_jobs_registry() -> None:
+    with _lock:
+        _jobs.clear()
 
 
 def read_job_log(job_id: str, job: ExportJob | None = None) -> list[str]:

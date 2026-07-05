@@ -255,6 +255,10 @@ def normalize_pad_color(color: str) -> str:
     return color
 
 
+# Limite pratique split+trim+concat (swscaler). Budget réparti sur les fondus.
+MAX_EXPORT_SEGMENTS = 200
+
+
 def _interp_frame(f0: dict, f1: dict, ratio: float) -> dict:
     return {
         "x": float(f0["x"]) + (float(f1["x"]) - float(f0["x"])) * ratio,
@@ -264,41 +268,205 @@ def _interp_frame(f0: dict, f1: dict, ratio: float) -> dict:
     }
 
 
-def _expand_segments(
+def _fade_substep_count(fade_sec: float, fps: float, *, cap: int) -> int:
+    """Pas de fondu : ~1 pas / 2 frames, plafonné pour rester sous MAX_EXPORT_SEGMENTS."""
+    ideal = max(10, min(40, int(round(fade_sec * fps / 2))))
+    return max(6, min(ideal, cap))
+
+
+def _keyframe_interp_ratio(
+    time: float,
+    t0: float,
+    t1: float,
+    transition_sec: float,
+    *,
+    interpolate: bool,
+) -> float:
+    if not interpolate:
+        return 0.0
+    span = t1 - t0
+    if span <= 0:
+        return 1.0
+    fade = min(max(0.0, float(transition_sec)), span)
+    fade_start = t1 - fade
+    if time <= fade_start:
+        return 0.0
+    return (time - fade_start) / fade if fade > 0 else 1.0
+
+
+def _frame_at_time(
+    sorted_kf: list[dict],
+    time: float,
+    *,
+    interpolate: bool,
+    transition_sec: float,
+) -> dict:
+    if not sorted_kf:
+        return {"x": 0.0, "y": 0.0, "width": 2.0, "height": 2.0}
+    if time <= float(sorted_kf[0]["time"]):
+        return dict(sorted_kf[0]["frame"])
+    if time >= float(sorted_kf[-1]["time"]):
+        return dict(sorted_kf[-1]["frame"])
+    for i in range(len(sorted_kf) - 1):
+        a = sorted_kf[i]
+        b = sorted_kf[i + 1]
+        t0 = float(a["time"])
+        t1 = float(b["time"])
+        if t0 <= time <= t1:
+            ratio = _keyframe_interp_ratio(
+                time, t0, t1, transition_sec, interpolate=interpolate
+            )
+            fa, fb = a["frame"], b["frame"]
+            return {
+                "x": float(fa["x"]) + (float(fb["x"]) - float(fa["x"])) * ratio,
+                "y": float(fa["y"]) + (float(fb["y"]) - float(fa["y"])) * ratio,
+                "width": float(fa["width"])
+                + (float(fb["width"]) - float(fa["width"])) * ratio,
+                "height": float(fa["height"])
+                + (float(fb["height"]) - float(fa["height"])) * ratio,
+            }
+    return dict(sorted_kf[-1]["frame"])
+
+
+def _normalize_export_range(
+    export_start: float,
+    export_end: float | None,
+    duration_sec: float,
+) -> tuple[float, float, bool]:
+    """Retourne (start, end, is_partial)."""
+    duration = max(0.0, float(duration_sec))
+    start = max(0.0, float(export_start or 0.0))
+    end = duration if export_end is None else min(duration, float(export_end))
+    end = max(start + 0.03, end)
+    is_partial = start > 0.01 or end < duration - 0.05
+    return start, end, is_partial
+
+
+def _effective_export_keyframes(
+    sorted_kf: list[dict],
+    export_start: float,
+    export_end: float,
+    *,
+    interpolate: bool,
+    transition_sec: float,
+) -> list[dict]:
+    effective: list[dict] = []
+    has_at_start = False
+    for kf in sorted_kf:
+        t = float(kf["time"])
+        if t < export_start - 0.001:
+            continue
+        if t > export_end + 0.001:
+            break
+        if abs(t - export_start) < 0.02:
+            has_at_start = True
+        effective.append(kf)
+    if not has_at_start:
+        effective.insert(
+            0,
+            {
+                "time": export_start,
+                "frame": _frame_at_time(
+                    sorted_kf,
+                    export_start,
+                    interpolate=interpolate,
+                    transition_sec=transition_sec,
+                ),
+            },
+        )
+    if not effective:
+        raise ValueError("Aucun cadrage dans la plage export.")
+    return effective
+
+
+def _clamp_segments_to_range(
+    segments: list[tuple[float, float, dict]],
+    export_start: float,
+    export_end: float,
+) -> list[tuple[float, float, dict]]:
+    out: list[tuple[float, float, dict]] = []
+    for t0, t1, frame in segments:
+        ct0 = max(t0, export_start)
+        ct1 = min(t1, export_end)
+        if ct1 - ct0 >= 0.03:
+            out.append((ct0, ct1, frame))
+    return out
+
+
+def _keyframe_interval_segments(
     sorted_kf: list[dict],
     duration: float,
     *,
-    step_sec: float = 0.15,
-    max_steps: int = 80,
-) -> list[tuple[float, float, dict, dict, bool]]:
-    """Découpe les intervalles en sous-segments à crop fixe (interpolation)."""
-    segments: list[tuple[float, float, dict, dict, bool]] = []
+    interpolate: bool,
+    transition_sec: float = 1.0,
+    fps: float = 30.0,
+) -> list[tuple[float, float, dict]]:
+    """
+    Segments entre keyframes.
+    ffmpeg n'anime que x/y par frame — w/h sont figés à l'init du crop.
+    Le fondu est découpé en sous-segments à crop fixe (zoom + pan synchrones).
+    """
+    segments: list[tuple[float, float, dict]] = []
+    fade_intervals = 0
+    if interpolate:
+        for i, kf in enumerate(sorted_kf):
+            if i + 1 >= len(sorted_kf):
+                break
+            t0 = float(kf["time"])
+            t1 = float(sorted_kf[i + 1]["time"])
+            if t1 - t0 >= 0.03:
+                fade_intervals += 1
+
+    fade_cap = (
+        max(6, (MAX_EXPORT_SEGMENTS - len(sorted_kf)) // max(1, fade_intervals))
+        if fade_intervals
+        else 30
+    )
+
     for i, kf in enumerate(sorted_kf):
         t0 = float(kf["time"])
         t1 = float(sorted_kf[i + 1]["time"]) if i + 1 < len(sorted_kf) else duration
-        f0 = kf["frame"]
-        f1 = sorted_kf[i + 1]["frame"] if i + 1 < len(sorted_kf) else f0
         span = t1 - t0
         if span < 0.03:
             continue
+        f0 = kf["frame"]
         if i + 1 >= len(sorted_kf):
-            segments.append((t0, t1, f0, f0, True))
+            segments.append((t0, t1, f0))
             continue
-        steps = min(max_steps, max(1, int(math.ceil(span / step_sec))))
+        f1 = sorted_kf[i + 1]["frame"]
+        if not interpolate:
+            segments.append((t0, t1, f0))
+            continue
+
+        fade = min(max(0.0, float(transition_sec)), span)
+        if fade < 0.03:
+            segments.append((t0, t1, f0))
+            continue
+
+        steps = _fade_substep_count(fade, fps, cap=fade_cap)
+
+        if fade >= span - 1e-6:
+            for s in range(steps):
+                ft0 = t0 + span * s / steps
+                ft1 = t0 + span * (s + 1) / steps
+                if ft1 - ft0 < 0.001:
+                    continue
+                ratio = (s + 0.5) / steps
+                segments.append((ft0, ft1, _interp_frame(f0, f1, ratio)))
+            continue
+
+        hold_end = t1 - fade
+        if hold_end - t0 >= 0.03:
+            segments.append((t0, hold_end, f0))
         for s in range(steps):
-            st0 = t0 + span * s / steps
-            st1 = t0 + span * (s + 1) / steps
-            mid = (s + 0.5) / steps
-            fm = _interp_frame(f0, f1, mid)
-            segments.append((st0, st1, fm, fm, True))
+            ft0 = hold_end + fade * s / steps
+            ft1 = hold_end + fade * (s + 1) / steps
+            if ft1 - ft0 < 0.001:
+                continue
+            ratio = (s + 0.5) / steps
+            segments.append((ft0, ft1, _interp_frame(f0, f1, ratio)))
+
     return segments
-
-
-def _lerp_segment_expr(v0: float, v1: float, span: float) -> str:
-    """Interpolation linéaire sans virgule (compatible -vf/-filter_complex)."""
-    if abs(span) < 1e-6:
-        return f"{v1:.2f}"
-    return f"{v0:.2f}+({v1:.2f}-{v0:.2f})*t/{span:.2f}"
 
 
 def _segment_reframe_chain(
@@ -306,10 +474,8 @@ def _segment_reframe_chain(
     out_label: str,
     t0: float,
     t1: float,
-    f0: dict,
-    f1: dict,
+    frame: dict,
     *,
-    hold: bool,
     output_w: int,
     output_h: int,
     pad_left: int,
@@ -322,27 +488,18 @@ def _segment_reframe_chain(
 ) -> str:
     out_w = _even(output_w)
     out_h = _even(output_h)
-    span = t1 - t0
 
     chain = f"{in_label}trim=start={t0:.3f}:end={t1:.3f},setpts=PTS-STARTPTS"
     if pad_left or pad_top or pad_right or pad_bottom:
         chain += f",pad={padded_w}:{padded_h}:{pad_left}:{pad_top}:{pad_color}"
 
-    if hold or abs(span) < 0.05:
-        fw = _even(max(2.0, float(f0["width"])))
-        fh = _even(max(2.0, float(f0["height"])))
-        cx = _even_pos(float(f0["x"]) + pad_left)
-        cy = _even_pos(float(f0["y"]) + pad_top)
-        chain += f",crop={fw}:{fh}:{cx}:{cy}"
-    else:
-        fw = _even(max(2.0, float(f0["width"])))
-        fh = _even(max(2.0, float(f0["height"])))
-        cx = _even_pos(float(f0["x"]) + pad_left)
-        cy = _even_pos(float(f0["y"]) + pad_top)
-        chain += f",crop={fw}:{fh}:{cx}:{cy}"
-
+    fw = _even(max(2.0, float(frame["width"])))
+    fh = _even(max(2.0, float(frame["height"])))
+    cx = _even_pos(float(frame["x"]) + pad_left)
+    cy = _even_pos(float(frame["y"]) + pad_top)
+    chain += f",crop={fw}:{fh}:{cx}:{cy}"
     chain += f",scale={out_w}:{out_h}:force_original_aspect_ratio=decrease"
-    chain += f",pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:{pad_color},format=yuv420p"
+    chain += f",pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:{pad_color},setsar=1,format=yuv420p"
     return chain + out_label
 
 
@@ -355,18 +512,41 @@ def build_reframe_filter_keyframes(
     pad_color: str = "black",
     *,
     duration_sec: float = 0.0,
+    fps: float = 30.0,
+    interpolate_keyframes: bool = True,
+    transition_sec: float = 1.0,
+    export_start: float = 0.0,
+    export_end: float | None = None,
 ) -> dict[str, str]:
     """
-    Filtre recadrage avec interpolation linéaire entre keyframes.
-    Retourne {"vf": "..."} ou {"filter_complex": "..."}.
+    Filtre recadrage : palier + fondu transition_sec avant chaque keyframe suivant.
+    export_start / export_end limitent la plage exportée (temps source).
     """
     if not keyframes:
         raise ValueError("Au moins un keyframe requis.")
 
     sorted_kf = sorted(keyframes, key=lambda k: float(k["time"]))
-    if len(sorted_kf) == 1:
-        f = sorted_kf[0]["frame"]
-        return {
+    duration = duration_sec or float(sorted_kf[-1]["time"]) + 1.0
+    ex_start, ex_end, is_partial = _normalize_export_range(
+        export_start, export_end, duration
+    )
+
+    if is_partial:
+        work_kf = _effective_export_keyframes(
+            sorted_kf,
+            ex_start,
+            ex_end,
+            interpolate=interpolate_keyframes,
+            transition_sec=transition_sec,
+        )
+        seg_duration = ex_end
+    else:
+        work_kf = sorted_kf
+        seg_duration = duration
+
+    if len(work_kf) == 1 and not is_partial:
+        f = work_kf[0]["frame"]
+        spec: dict[str, str] = {
             "vf": build_reframe_filter(
                 source_w,
                 source_h,
@@ -379,33 +559,49 @@ def build_reframe_filter_keyframes(
                 normalize_pad_color(pad_color),
             )
         }
+        return spec
 
-    pad_color = normalize_pad_color(pad_color)
+    pad_color_norm = normalize_pad_color(pad_color)
+    slice_len = ex_end - ex_start
     pad_left, pad_top, pad_right, pad_bottom = _compute_max_padding(
-        source_w, source_h, sorted_kf
+        source_w, source_h, work_kf if is_partial else sorted_kf
     )
     padded_w = _even(source_w + pad_left + pad_right)
     padded_h = _even(source_h + pad_top + pad_bottom)
 
-    duration = duration_sec or float(sorted_kf[-1]["time"]) + 1.0
-    segments = _expand_segments(sorted_kf, duration)
+    if len(work_kf) == 1:
+        segments = [(0.0, slice_len, work_kf[0]["frame"])]
+    else:
+        segments = _keyframe_interval_segments(
+            work_kf,
+            seg_duration,
+            interpolate=interpolate_keyframes,
+            transition_sec=transition_sec,
+            fps=fps,
+        )
+        if is_partial:
+            segments = _clamp_segments_to_range(segments, ex_start, ex_end)
+            segments = [
+                (t0 - ex_start, t1 - ex_start, frame)
+                for t0, t1, frame in segments
+            ]
 
     if not segments:
-        f = sorted_kf[0]["frame"]
+        f = work_kf[0]["frame"]
         return {
             "vf": build_reframe_filter(
                 source_w, source_h, output_w, output_h,
                 float(f["x"]), float(f["y"]), float(f["width"]), float(f["height"]),
-                pad_color,
+                pad_color_norm,
             )
         }
 
-    n = len(segments)
-    split_outs = " ".join(f"[sk{i}]" for i in range(n))
-    parts = [f"[0:v]split={n} {split_outs}"]
+    n_seg = len(segments)
+    split_outs = " ".join(f"[sk{i}]" for i in range(n_seg))
+    parts = [f"[0:v]split={n_seg} {split_outs}"]
     vlabels: list[str] = []
 
-    for i, (t0, t1, f0, f1, hold) in enumerate(segments):
+    for i, (t0, t1, frame) in enumerate(segments):
         in_label = f"[sk{i}]"
         out_label = f"[v{i}]"
         parts.append(
@@ -414,9 +610,7 @@ def build_reframe_filter_keyframes(
                 out_label,
                 t0,
                 t1,
-                f0,
-                f1,
-                hold=hold,
+                frame,
                 output_w=output_w,
                 output_h=output_h,
                 pad_left=pad_left,
@@ -425,17 +619,22 @@ def build_reframe_filter_keyframes(
                 pad_bottom=pad_bottom,
                 padded_w=padded_w,
                 padded_h=padded_h,
-                pad_color=pad_color,
+                pad_color=pad_color_norm,
             )
         )
         vlabels.append(out_label)
 
-    parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0:unsafe=1[outv]")
-    return {"filter_complex": ";".join(parts)}
-
-
-def _even_expr(expr: str) -> str:
-    return f"2*floor(({expr})/2)"
+    parts.append(f"{''.join(vlabels)}concat=n={n_seg}:v=1:a=0:unsafe=1[outv]")
+    result: dict[str, str | int] = {
+        "filter_complex": ";".join(parts),
+        "segment_count": n_seg,
+    }
+    if is_partial:
+        result["audio_filter"] = (
+            f"atrim=start=0:end={slice_len:.3f},asetpts=PTS-STARTPTS"
+        )
+        result["input_seek"] = ex_start
+    return result
 
 
 def _compute_max_padding(
@@ -573,6 +772,8 @@ def export_copy(
     input_path: Path,
     output_path: Path,
     *,
+    export_start: float = 0.0,
+    export_end: float | None = None,
     on_progress: Callable[[dict[str, str | float | int]], None] | None = None,
 ) -> None:
     """Recopie les flux sans ré-encodage (même taille / qualité)."""
@@ -582,14 +783,19 @@ def export_copy(
         "-hide_banner",
         "-loglevel",
         "info",
-        "-i",
-        str(input_path),
+    ]
+    if export_start > 0.01:
+        args.extend(["-ss", f"{export_start:.3f}"])
+    args.extend(["-ignore_editlist", "1", "-i", str(input_path)])
+    if export_end is not None and export_end > export_start + 0.03:
+        args.extend(["-to", f"{export_end:.3f}"])
+    args.extend([
         "-c",
         "copy",
         "-movflags",
         "+faststart",
         str(output_path),
-    ]
+    ])
     if on_progress:
         on_progress({"log": f"$ {' '.join(args)}"})
         on_progress({"log": "Copie directe (sans ré-encodage)."})
@@ -609,6 +815,8 @@ def export_video(
     video_filter: str = "",
     *,
     filter_complex: str = "",
+    audio_filter: str = "",
+    input_seek: float = 0.0,
     duration_sec: float = 0.0,
     crf: int = 23,
     preset: str = "medium",
@@ -650,6 +858,8 @@ def export_video(
                 on_progress,
                 video_filter=video_filter,
                 filter_complex=filter_complex,
+                audio_filter=audio_filter,
+                input_seek=input_seek,
             )
             return
         except RuntimeError as exc:
@@ -668,6 +878,8 @@ def _run_ffmpeg_export(
     *,
     video_filter: str = "",
     filter_complex: str = "",
+    audio_filter: str = "",
+    input_seek: float = 0.0,
 ) -> None:
     args = [
         "ffmpeg",
@@ -677,20 +889,36 @@ def _run_ffmpeg_export(
         "info",
         "-stats_period",
         "1",
-        "-i",
-        str(input_path),
     ]
-    if filter_complex:
-        args.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
+    if input_seek > 0.01:
+        args.extend(["-ss", f"{input_seek:.3f}"])
+    args.extend(["-ignore_editlist", "1", "-i", str(input_path)])
+    fc = filter_complex
+    if fc and audio_filter:
+        fc = f"{fc};[0:a]{audio_filter}[aout]"
+    if fc:
+        args.extend(["-filter_complex", fc, "-map", "[outv]"])
+        if audio_filter:
+            args.extend(["-map", "[aout]"])
+        else:
+            args.extend(["-map", "0:a?"])
     elif video_filter:
-        args.extend(["-vf", video_filter])
+        if audio_filter:
+            fc = f"[0:a]{audio_filter}[aout]"
+            args.extend(["-filter_complex", fc, "-vf", video_filter, "-map", "0:v", "-map", "[aout]"])
+        else:
+            args.extend(["-vf", video_filter, "-map", "0:v", "-map", "0:a?"])
     else:
         raise RuntimeError("Aucun filtre vidéo défini.")
 
+    if audio_filter:
+        audio_args = ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        audio_args = ["-c:a", "copy"]
+
     args.extend([
         *encoder_args,
-        "-c:a",
-        "copy",
+        *audio_args,
         "-movflags",
         "+faststart",
         str(output_path),
